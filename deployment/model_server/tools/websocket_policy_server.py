@@ -10,14 +10,13 @@ import traceback
 import websockets.asyncio.server
 import websockets.frames
 
-# from openpi_client import base_policy as _base_policy
 from . import msgpack_numpy
 
 
 class WebsocketPolicyServer:
     """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
 
-    Currently only implements the `load` and `infer` methods.
+    Configured deployments implement per-connection reset and sampler negotiation.
     """
 
     def __init__(
@@ -67,12 +66,16 @@ class WebsocketPolicyServer:
         packer = msgpack_numpy.Packer()
 
         await websocket.send(packer.pack(self._metadata))
+        from deployment.model_server.sampling_session import SamplingSession
+
+        contract = self._metadata.get("serving_contract")
+        session = SamplingSession(contract) if contract is not None else None
 
         while True:
             try:
                 msg = msgpack_numpy.unpackb(await websocket.recv())
                 self._last_active = time.time()  # Refresh active time on each received message
-                ret = self._route_message(msg)  # route message
+                ret = self._route_message(msg, session)  # route message
                 await websocket.send(packer.pack(ret))
             except websockets.ConnectionClosed:
                 logging.info(f"Connection from {websocket.remote_address} closed")
@@ -86,66 +89,46 @@ class WebsocketPolicyServer:
                 raise
 
     # route logic: recognize request from client
-    def _route_message(self, msg: dict) -> dict:
-        """
-        Route rules (fault-tolerant):
-        - Supports messages of form:
-            {"type": "ping|init|infer|reset", "request_id": "...", "payload": {...}}
-          or a flat dict (will be treated as payload).
-        - Does NOT raise inside this function: all exceptions are caught and encoded in response.
-        """
+    def _route_message(self, msg: dict, session=None) -> dict:
+        """Native RPC dispatch; configured sessions require an explicit reset."""
         req_id = msg.get("request_id", "default")
-        mtype = msg.get("type", "infer")  # default = infer
-        payload = msg.get("payload", msg)  # when no explicit payload, treat top-level as payload
-
-        # ping
-        if mtype == "ping":
-            return {"status": "ok", "ok": True, "type": "ping", "request_id": req_id}
-
-        # infer --> framework.predict_action
-        elif mtype == "infer" or mtype == "predict_action":
-            # Basic payload sanity
+        kind = msg.get("type", "infer")
+        response_type = "inference_result" if kind in {"infer", "predict_action"} else kind
+        if kind not in {"infer", "predict_action", "ping", "reset"}:
+            response_type = "unknown"
+        response = {"request_id": req_id, "type": response_type, "ok": True, "status": "ok"}
+        try:
+            if kind == "ping":
+                return response
+            if kind == "reset":
+                if session is None:
+                    raise ValueError("This deployment has no session/reset contract")
+                session.reset(msg.get("session_id"))
+                return {**response, "session_id": session.session_id}
+            if kind not in {"infer", "predict_action"}:
+                raise ValueError(f"Unsupported message type {kind!r}")
+            payload = msg.get("payload", msg)
             if not isinstance(payload, dict):
-                return {
-                    "status": "error",
-                    "ok": False,
-                    "type": "inference_result",
-                    "request_id": req_id,
-                    "error": {"message": "Payload must be a dict", "payload_type": str(type(payload))},
-                }
-            try:
-                output_dict = self._policy.predict_action(**payload)
-            except Exception as e:
-                logging.exception("Policy inference error (request_id=%s)", req_id)
-                logging.exception(e)
-
-                return {
-                    "status": "error",
-                    "ok": False,
-                    "type": "inference_result",
-                    "request_id": req_id,
-                    "error": {
-                        "message": str(e),
-                    },
-                }
-            data = output_dict
-            return {
-                "status": "ok",
-                "ok": True,
-                "type": "inference_result",
-                "request_id": req_id,
-                "data": data,
-            }
-
-        # unknow request type
-        else:
-            return {
-                "status": "error",
-                "ok": False,
-                "type": "unknown",
-                "request_id": req_id,
-                "error": {"message": f"Unsupported message type '{mtype}'"},
-            }
+                raise ValueError("Payload must be a dict")
+            sampling = payload.get("sampling", {"mode": "default"})
+            if session is not None:
+                if session.session_id is None or msg.get("session_id") != session.session_id:
+                    raise ValueError("Inference session has not been reset or does not match")
+                parameters = session.parameters(sampling)
+                payload = dict(payload)
+                if parameters["mode"] == "default":
+                    payload.pop("sampling", None)
+                else:
+                    payload["sampling"] = parameters
+                if payload.get("unnorm_key") != session.contract["unnorm_key"]:
+                    raise ValueError("unnorm_key differs from the deployment contract")
+            result = self._policy.predict_action(**payload)
+            if session is not None:
+                result = session.finish(result, sampling)
+            return {**response, "data": result}
+        except Exception as error:
+            logging.exception("Policy request failed (request_id=%s)", req_id)
+            return {**response, "ok": False, "status": "error", "error": {"message": str(error)}}
 
 
 if __name__ == "__main__":

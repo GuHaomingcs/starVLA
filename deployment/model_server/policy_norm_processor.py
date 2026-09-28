@@ -357,6 +357,25 @@ class PolicyNormProcessor:
     # ------------------------------------------------------------------
     # Inverse path (model output → env action)
     # ------------------------------------------------------------------
+    def apply_actions(self, actions: np.ndarray) -> np.ndarray:
+        """Normalize an environment-unit sampler condition with training transforms."""
+        actions = np.array(actions, dtype=np.float32, copy=True)
+        if actions.ndim != 2 or actions.shape[-1] != self.action_dim or not np.isfinite(actions).all():
+            raise ValueError(f"Expected finite action condition (H, {self.action_dim})")
+        data, cursor = {}, 0
+        for key in self._action_keys:
+            width = self._action_key_dims[key]
+            data[key] = actions[:, cursor:cursor + width]
+            cursor += width
+        normalized = self._transform.apply(data)
+        values = []
+        for key in self._action_keys:
+            value = normalized[key]
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().numpy()
+            values.append(np.asarray(value, dtype=np.float32))
+        return np.concatenate(values, axis=-1)
+
     def unapply_actions(self, normalized_actions: np.ndarray) -> np.ndarray:
         """Invert action normalization using the training-time pipeline.
 
@@ -398,3 +417,58 @@ class PolicyNormProcessor:
                 v = v.detach().cpu().numpy()
             parts.append(np.asarray(v))
         return np.concatenate(parts, axis=-1)
+
+    @property
+    def action_dim(self) -> int:
+        return sum(self._action_key_dims.values())
+
+    @property
+    def state_dim(self) -> int:
+        return sum(self._state_key_dims.values())
+
+    def apply_state(self, state: np.ndarray) -> np.ndarray:
+        """Normalize proprioceptive state using the training-time pipeline.
+
+        Args:
+            state: shape ``(T, D)`` or ``(D,)`` where
+                ``D == sum(state_key_dims.values())``.
+
+        Returns:
+            State with the same rank as the input, normalized in the format
+            expected by the framework at training time.
+        """
+        if not self._state_keys:
+            raise ValueError("Checkpoint has no state transform")
+
+        # MessagePack/websocket decoders may return a read-only NumPy view.
+        # Training transforms convert slices to tensors, so keep this buffer
+        # writable to avoid undefined behavior in PyTorch.
+        state_arr = np.array(state, dtype=np.float32, copy=True)
+        original_ndim = state_arr.ndim
+        if state_arr.ndim == 1:
+            state_arr = state_arr[None, :]
+        if state_arr.ndim != 2 or not np.isfinite(state_arr).all():
+            raise ValueError(f"Expected state shape (T, D) or (D,), got {state_arr.shape}")
+
+        data: Dict[str, np.ndarray] = {}
+        cursor = 0
+        for full_key in self._state_keys:
+            dim_k = self._state_key_dims[full_key]
+            data[full_key] = state_arr[..., cursor : cursor + dim_k]
+            cursor += dim_k
+
+        if cursor != state_arr.shape[-1]:
+            raise ValueError(
+                f"Sum of per-key dims ({cursor}) != state_dim ({state_arr.shape[-1]}). "
+                f"state_keys={self._state_keys}, state_key_dims={self._state_key_dims}"
+            )
+
+        out = self._transform.apply(data)
+        parts: List[np.ndarray] = []
+        for full_key in self._state_keys:
+            v = out[full_key]
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().numpy()
+            parts.append(np.asarray(v, dtype=np.float32))
+        normalized = np.concatenate(parts, axis=-1)
+        return normalized[0] if original_ndim == 1 else normalized

@@ -31,6 +31,7 @@ from starVLA.model.framework.base_framework import baseframework, merge_config_o
 from starVLA.model.framework.share_tools import read_mode_config
 
 from deployment.model_server.policy_norm_processor import PolicyNormProcessor
+from deployment.model_server.serving_contract import configure_contract
 
 
 def _training_obs_image_size(model_cfg: Dict[str, Any]) -> Optional[List[int]]:
@@ -60,6 +61,7 @@ class PolicyServerWrapper:
         use_bf16: bool = False,
         unnorm_key: Optional[str] = None,
         config_overrides: Sequence[str] | None = None,
+        deployment: Optional[dict] = None,
     ) -> None:
         self._ckpt_path = str(ckpt_path)
 
@@ -116,12 +118,12 @@ class PolicyServerWrapper:
                 self._available_unnorm_keys,
             )
 
+        self._deployment = configure_contract(self, deployment) if deployment is not None else None
+
     def _get_processor(self, unnorm_key: Optional[str]) -> PolicyNormProcessor:
         cache_key = unnorm_key if unnorm_key is not None else "__default__"
         if cache_key not in self._norm_processors:
-            self._norm_processors[cache_key] = PolicyNormProcessor(
-                self._ckpt_path, unnorm_key=unnorm_key
-            )
+            self._norm_processors[cache_key] = PolicyNormProcessor(self._ckpt_path, unnorm_key=unnorm_key)
         return self._norm_processors[cache_key]
 
     def get_norm_processor(self, unnorm_key: Optional[str] = None) -> PolicyNormProcessor:
@@ -131,9 +133,7 @@ class PolicyServerWrapper:
         the training-time ``action_keys`` / ``state_keys`` and their per-key
         dims so they can split the flat action chunk into named groups.
         """
-        return self._get_processor(
-            unnorm_key if unnorm_key is not None else self._default_unnorm_key
-        )
+        return self._get_processor(unnorm_key if unnorm_key is not None else self._default_unnorm_key)
 
     @property
     def metadata(self) -> Dict[str, Any]:
@@ -156,6 +156,10 @@ class PolicyServerWrapper:
             proc = self._get_processor(self._default_unnorm_key)
             base["action_keys"] = proc.action_keys
             base["state_keys"] = proc.state_keys
+        if self._deployment is not None:
+            base["serving_contract"] = dict(self._deployment)
+            base["protocol_version"] = 1
+            base["supports_reset"] = True
         return base
 
     def predict_action(
@@ -187,6 +191,20 @@ class PolicyServerWrapper:
                 )
         proc = self._get_processor(effective_key)
 
+        if self._deployment is not None:
+            from deployment.model_server.serving_contract import validate_examples
+
+            examples = validate_examples(examples, self._deployment)
+            if self._deployment["include_state"]:
+                examples = [{**e, "state": proc.apply_state(e["state"])} for e in examples]
+        sampling = kwargs.get("sampling")
+        if sampling is not None:
+            if self._deployment is None or sampling["mode"] not in self._deployment["sampling_modes"]:
+                raise ValueError("Sampling mode is not enabled for this deployment")
+            sampling = dict(sampling)
+            if "action_condition" in sampling:
+                sampling["action_condition"] = proc.apply_actions(sampling["action_condition"])
+            kwargs["sampling"] = sampling
         out = self._framework.predict_action(examples=examples, **kwargs)
         normalized = np.asarray(out["normalized_actions"])  # (B, T, D)
 
@@ -194,4 +212,6 @@ class PolicyServerWrapper:
             [proc.unapply_actions(normalized[b]) for b in range(normalized.shape[0])],
             axis=0,
         )
-        return {"actions": unnorm}
+        if unnorm.ndim != 3 or not np.isfinite(unnorm).all():
+            raise ValueError("Model returned invalid action chunks")
+        return {"actions": unnorm, **{k: v for k, v in out.items() if k != "normalized_actions"}}
